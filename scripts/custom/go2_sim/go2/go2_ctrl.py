@@ -10,11 +10,16 @@ from rsl_rl.runners import OnPolicyRunner
 
 base_vel_cmd_input = None
 camera_follow_enabled = True
+control_mode = "policy" # "policy" or "unitree"
+lowcmd_q_input = None # Store target joint positions from unitree LowCmd
+reset_requested = False # Flag to trigger simulation reset
 
 # Initialize base_vel_cmd_input as a tensor when created
 def init_base_vel_cmd(num_envs):
     global base_vel_cmd_input
+    global lowcmd_q_input
     base_vel_cmd_input = torch.zeros((num_envs, 3), dtype=torch.float32)
+    lowcmd_q_input = torch.zeros((num_envs, 12), dtype=torch.float32)
 
 # Modify base_vel_cmd to use the tensor directly
 def base_vel_cmd(env: ManagerBasedEnv) -> torch.Tensor:
@@ -25,15 +30,27 @@ def base_vel_cmd(env: ManagerBasedEnv) -> torch.Tensor:
 def sub_keyboard_event(event) -> bool:
     global base_vel_cmd_input
     global camera_follow_enabled
+    global control_mode
+    global reset_requested
     lin_vel = 1.5
     ang_vel = 1.5
     
     if base_vel_cmd_input is not None:
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            # Toggle control mode (Policy vs Unitree)
+            if event.input.name == 'M':
+                control_mode = "unitree" if control_mode == "policy" else "policy"
+                print(f"\n[INFO] Control Mode: {control_mode.upper()}")
+
             # Toggle camera follow
             if event.input.name == 'V':
                 camera_follow_enabled = not camera_follow_enabled
                 print(f"\n[INFO] Camera Follow: {'Enabled' if camera_follow_enabled else 'Disabled'}")
+                
+            # Request Environment Reset
+            if event.input.name == 'R':
+                reset_requested = True
+                print("\n[INFO] Environment reset requested...")
                 
             # Update tensor values for environment 0 individually
             if event.input.name == 'W':
@@ -83,16 +100,14 @@ def sub_keyboard_event(event) -> bool:
                     
     return True
 
-def get_rsl_flat_policy(cfg):
-    cfg.observations.policy.height_scan = None
-    env = gym.make("Isaac-Velocity-Flat-Unitree-Go2-v0", cfg=cfg)
+def get_rsl_flat_policy(env_cfg, sim_cfg):
+    env_cfg.observations.policy.height_scan = None
+    env = gym.make("Isaac-Velocity-Flat-Unitree-Go2-v0", cfg=env_cfg)
     env = RslRlVecEnvWrapper(env)
 
     # Low level control: rsl control policy
     agent_cfg: RslRlOnPolicyRunnerCfg = unitree_go2_flat_cfg
-    ckpt_path = get_checkpoint_path(log_path=os.path.join(os.path.dirname(__file__), "..", "ckpts"), 
-                                    run_dir=agent_cfg["load_run"], 
-                                    checkpoint=agent_cfg["load_checkpoint"])
+    ckpt_path = os.path.join(os.path.dirname(__file__), "..", "ckpts", sim_cfg.checkpoint)
     ppo_runner = OnPolicyRunner(env, agent_cfg, log_dir=None, device=agent_cfg["device"])
     ppo_runner.load(ckpt_path)
     policy = ppo_runner.get_inference_policy(device=agent_cfg["device"])

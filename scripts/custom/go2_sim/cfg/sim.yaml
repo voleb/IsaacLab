@@ -19,3 +19,5 @@ sim_app:
   width: 1280
   height: 720
   hide_ui: False
+
+checkpoint: "unitree_go2/flat_model_6800.pt"

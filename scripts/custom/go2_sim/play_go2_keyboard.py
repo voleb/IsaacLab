@@ -26,6 +26,13 @@ from go2.go2_env import Go2RSLEnvCfg, camera_follow
 import env.sim_env as sim_env
 import go2.go2_ctrl as go2_ctrl
 
+# Enable native ROS 2 bridge to load internal rclpy for python 3.11
+from isaacsim.core.utils.extensions import enable_extension
+enable_extension("omni.isaac.ros2_bridge")
+
+import cmd_vel_subscriber
+import rclpy
+
 FILE_PATH = os.path.join(os.path.dirname(__file__), "cfg")
 @hydra.main(config_path=FILE_PATH, config_name="sim", version_base=None)
 def run_simulator(cfg):
@@ -37,8 +44,8 @@ def run_simulator(cfg):
     go2_env_cfg.sim.render_interval = go2_env_cfg.decimation
     go2_ctrl.init_base_vel_cmd(cfg.num_envs)
     
-    # We load the flat policy model as requested (flat_model_6800.pt)
-    env, policy = go2_ctrl.get_rsl_flat_policy(go2_env_cfg)
+    # We load the flat policy model as requested, path provided by sim.yaml
+    env, policy = go2_ctrl.get_rsl_flat_policy(go2_env_cfg, cfg)
 
     # Simulation environment logic
     if (cfg.env_name == "obstacle-dense"):
@@ -70,6 +77,13 @@ def run_simulator(cfg):
     print("        Z - Rotate Left")
     print("        C - Rotate Right")
     print("        V - Toggle Camera Follow")
+    print("        R - Reset Environment")
+    print("        M - Toggle Control Mode (Policy/Unitree)")
+    print("        (Also listening to ROS 2 /cmd_vel and /lowcmd)")
+
+    # ROS 2 Bridge
+    rclpy.init()
+    cmd_vel_sub = cmd_vel_subscriber.CmdVelSubscriber()
 
     # Run simulation loop
     sim_step_dt = float(go2_env_cfg.sim.dt * go2_env_cfg.decimation)
@@ -77,12 +91,33 @@ def run_simulator(cfg):
 
     while simulation_app.is_running():
         start_time = time.time()
+        
+        # Handle Reset Request
+        if go2_ctrl.reset_requested:
+            # Force reset all environments by providing their IDs explicitly
+            env_ids = torch.arange(env.unwrapped.num_envs, device=env.unwrapped.device)
+            obs, _ = env.unwrapped.reset(env_ids=env_ids)
+            # Obs is returned dict but wrapper expects TensorDict, 
+            # so the safest way for VecEnvWrapper is to simply call env.reset()
+            # Which is handled gracefully in RslRlVecEnvWrapper 
+            # But let's actually just reset the episode_length_buf to force termination
+            env.unwrapped.episode_length_buf[:] = env.unwrapped.max_episode_length + 1
+            go2_ctrl.reset_requested = False
+            
         with torch.inference_mode():            
             # get actions from policy
             actions = policy(obs)
+            
+            # Override with Unitree ROS2 LowCmd if active
+            if go2_ctrl.control_mode == "unitree" and go2_ctrl.lowcmd_q_input is not None:
+                default_pos = env.unwrapped.scene["unitree_go2"].data.default_joint_pos
+                actions = (go2_ctrl.lowcmd_q_input.to(env.device) - default_pos) / 0.25
 
             # step the environment
             obs, _, _, _ = env.step(actions)
+
+            # Process ROS 2 callbacks
+            rclpy.spin_once(cmd_vel_sub, timeout_sec=0.0)
 
             # Camera follow if enabled
             if go2_ctrl.camera_follow_enabled:
@@ -98,6 +133,8 @@ def run_simulator(cfg):
         rtf = min(1.0, sim_step_dt/actual_loop_time)
         print(f"\rStep time: {actual_loop_time*1000:.2f}ms, Real Time Factor: {rtf:.2f}", end='', flush=True)
 
+    cmd_vel_sub.destroy_node()
+    rclpy.shutdown()
     simulation_app.close()
 
 if __name__ == "__main__":
